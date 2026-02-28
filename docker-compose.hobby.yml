@@ -1,11 +1,12 @@
 #
-# `docker-compose` file used ONLY for hobby deployments.
+# PostHog hobby deployment — modified for Dokploy
 #
-# Please take a look at https://posthog.com/docs/self-host/deploy/hobby
-# for more info.
-#
-# PostHog has sunset support for self-hosted K8s deployments.
-# See: https://posthog.com/blog/sunsetting-helm-support-posthog
+# Changes from upstream:
+#   - Removed `proxy` (Caddy) service; Traefik handles routing
+#   - Added dokploy-network + Traefik labels to `web` service
+#   - Fixed ./posthog/* paths to ./* (Dokploy clones the repo directly)
+#   - Removed `build` directives on Rust services (use pre-built images from base)
+#   - Removed host port bindings on internal services
 #
 
 services:
@@ -25,10 +26,6 @@ services:
             - redis7-data:/data
 
     clickhouse:
-        #
-        # Note: please keep the default version in sync across
-        #       `posthog` and the `charts-clickhouse` repos
-        #
         extends:
             file: docker-compose.base.yml
             service: clickhouse
@@ -37,13 +34,13 @@ services:
             - kafka
             - zookeeper
         volumes:
-            - ./posthog/posthog/idl:/idl
-            - ./posthog/docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
-            - ./posthog/docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
-            - ./posthog/docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml
-            - ./posthog/docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
-            - ./posthog/docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
-            - ./posthog/posthog/user_scripts:/var/lib/clickhouse/user_scripts
+            - ./posthog/idl:/idl
+            - ./docker/clickhouse/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+            - ./docker/clickhouse/config.xml:/etc/clickhouse-server/config.xml
+            - ./docker/clickhouse/config.d/default.xml:/etc/clickhouse-server/config.d/default.xml
+            - ./docker/clickhouse/users.xml:/etc/clickhouse-server/users.xml
+            - ./docker/clickhouse/user_defined_function.xml:/etc/clickhouse-server/user_defined_function.xml
+            - ./posthog/user_scripts:/var/lib/clickhouse/user_scripts
             - clickhouse-data:/var/lib/clickhouse
 
     zookeeper:
@@ -54,6 +51,7 @@ services:
             - zookeeper-datalog:/datalog
             - zookeeper-data:/data
             - zookeeper-logs:/logs
+
     kafka:
         extends:
             file: docker-compose.base.yml
@@ -97,6 +95,7 @@ services:
                 condition: service_healthy
             web:
                 condition: service_started
+
     web:
         extends:
             file: docker-compose.base.yml
@@ -133,6 +132,15 @@ services:
             - kafka
             - objectstorage
             - seaweedfs
+        networks:
+            - default
+            - dokploy-network
+        labels:
+            - "traefik.enable=true"
+            - "traefik.http.routers.posthog.rule=Host(`${DOMAIN}`)"
+            - "traefik.http.routers.posthog.entrypoints=websecure"
+            - "traefik.http.routers.posthog.tls.certResolver=letsencrypt"
+            - "traefik.http.services.posthog.loadbalancer.server.port=8000"
 
     plugins:
         extends:
@@ -173,33 +181,13 @@ services:
             - objectstorage
             - seaweedfs
 
-    proxy:
-        extends:
-            file: docker-compose.base.yml
-            service: proxy
-        ports:
-            - '80:80'
-            - '443:443'
-        volumes:
-            - caddy-data:/data
-            - caddy-config:/config
-        environment:
-            CADDY_TLS_BLOCK: $TLS_BLOCK
-            CADDY_HOST: '$DOMAIN, http://, https://'
-        depends_on:
-            - web
-            - livestream
     objectstorage:
         extends:
             file: docker-compose.base.yml
             service: objectstorage
-
         restart: on-failure
         volumes:
             - objectstorage:/data
-        ports:
-            - '19000:19000'
-            - '19001:19001'
 
     seaweedfs:
         extends:
@@ -231,38 +219,37 @@ services:
             SECRET_KEY: $POSTHOG_SECRET
             SKIP_ASYNC_MIGRATIONS_SETUP: 0
 
-    # Temporal containers
     temporal:
         extends:
             file: docker-compose.base.yml
             service: temporal
         environment:
             - ENABLE_ES=false
-        ports:
-            - 7233:7233
         volumes:
-            - ./posthog/docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+            - ./docker/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig
+
     elasticsearch:
         extends:
             file: docker-compose.base.yml
             service: elasticsearch
+
     temporal-admin-tools:
         extends:
             file: docker-compose.base.yml
             service: temporal-admin-tools
         depends_on:
             - temporal
+
     temporal-ui:
         extends:
             file: docker-compose.base.yml
             service: temporal-ui
-        ports:
-            - 8081:8080
         depends_on:
             temporal:
                 condition: service_started
             db:
                 condition: service_healthy
+
     temporal-django-worker:
         command: /compose/temporal-django-worker
         extends:
@@ -287,8 +274,6 @@ services:
         extends:
             file: docker-compose.base.yml
             service: cyclotron-janitor
-        build:
-            context: ./posthog/rust
         environment:
             DATABASE_URL: 'postgres://posthog:posthog@db:5432/posthog'
             KAFKA_HOSTS: 'kafka:9092'
@@ -299,22 +284,16 @@ services:
                 condition: service_started
 
     capture:
-        build:
-            context: ./posthog/rust
         extends:
             file: docker-compose.base.yml
             service: capture
 
     replay-capture:
-        build:
-            context: ./posthog/rust
         extends:
             file: docker-compose.base.yml
             service: replay-capture
 
     property-defs-rs:
-        build:
-            context: ./posthog/rust
         extends:
             file: docker-compose.base.yml
             service: property-defs-rs
@@ -331,11 +310,9 @@ services:
         environment:
             - LIVESTREAM_JWT_SECRET=${POSTHOG_SECRET}
         volumes:
-            - ./posthog/docker/livestream/configs-hobby.yml:/configs/configs.yml
+            - ./docker/livestream/configs-hobby.yml:/configs/configs.yml
 
     feature-flags:
-        build:
-            context: ./posthog/rust
         extends:
             file: docker-compose.base.yml
             service: feature-flags
@@ -353,22 +330,18 @@ services:
                 echo "Waiting for Kafka broker to accept connections..."
                 TIMEOUT=60
                 ELAPSED=0
-                # Use rpk topic list as the readiness check - it's a simple operation
-                # that confirms the broker is accepting Kafka protocol requests
                 until rpk topic list --brokers kafka:9092 2>/dev/null; do
-                    echo "Kafka broker not ready yet (elapsed: ${ELAPSED}s)..."
+                    echo "Kafka broker not ready yet (elapsed: $${ELAPSED}s)..."
                     sleep 2
-                    ELAPSED=$((ELAPSED + 2))
-                    if [ $ELAPSED -ge $TIMEOUT ]; then
-                        echo "Timeout waiting for Kafka broker after ${TIMEOUT}s"
+                    ELAPSED=$$((ELAPSED + 2))
+                    if [ $$ELAPSED -ge $$TIMEOUT ]; then
+                        echo "Timeout waiting for Kafka broker after $${TIMEOUT}s"
                         echo "Final attempt to list topics:"
                         rpk topic list --brokers kafka:9092 || true
                         exit 1
                     fi
                 done
                 echo "Kafka broker is accepting requests, creating topics..."
-                # Create topics needed by rust services
-                # Note: $$ escapes $ for docker-compose variable substitution
                 for topic in exceptions_ingestion clickhouse_events_json; do
                     if rpk topic create "$$topic" --brokers kafka:9092 -p 1 -r 1 2>&1; then
                         echo "Topic $$topic created successfully"
@@ -390,10 +363,6 @@ services:
 
     cymbal:
         image: ghcr.io/posthog/posthog/cymbal:master
-        build:
-            context: ./posthog/rust
-            args:
-                BIN: cymbal
         restart: on-failure
         volumes:
             - ./share:/share
@@ -432,8 +401,10 @@ volumes:
     seaweedfs:
     postgres-data:
     clickhouse-data:
-    caddy-data:
-    caddy-config:
     redis7-data:
     kafka-data:
     redpanda-data:
+
+networks:
+    dokploy-network:
+        external: true
